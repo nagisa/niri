@@ -2211,6 +2211,7 @@ dependencies = [
  "approx",
  "arrayvec",
  "async-channel",
+ "async-executor",
  "async-io",
  "atomic",
  "bitflags",
