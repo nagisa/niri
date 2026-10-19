@@ -1,16 +1,15 @@
 use std::ffi::OsStr;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::RwLock;
 use std::{io, thread};
 
-use async_io::Async;
+use async_process::Child;
 use atomic::Atomic;
 use libc::{getrlimit, rlim_t, rlimit, setrlimit, RLIMIT_NOFILE};
 use niri_config::Environment;
-use smithay::reexports::rustix;
 use smithay::wayland::xdg_activation::XdgActivationToken;
 
 use crate::utils::expand_home;
@@ -78,7 +77,8 @@ static SPAWNING_CHANNEL: std::sync::LazyLock<async_channel::Sender<Message>> =
                             continue;
                         };
                         if let Some(child) = spawn_sync(command, args, token) {
-                            ex.spawn(reap(child)).detach();
+                            // async_process will reap this process for us.
+                            drop(child);
                         }
                     }
                 }));
@@ -86,35 +86,6 @@ static SPAWNING_CHANNEL: std::sync::LazyLock<async_channel::Sender<Message>> =
             .unwrap();
         sender
     });
-
-#[cfg(target_os = "linux")]
-async fn reap(mut child: Child) {
-    let pid = rustix::process::Pid::from_child(&child);
-    let pidfd = match rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()) {
-        Ok(pidfd) => pidfd,
-        Err(e) => {
-            warn!("error opening child pidfd: {e:?}");
-            return;
-        }
-    };
-    let pidfd = match Async::new(pidfd) {
-        Ok(pidfd) => pidfd,
-        Err(e) => {
-            warn!("error making child pidfd async: {e:?}");
-            return;
-        }
-    };
-    if let Err(e) = pidfd.readable().await {
-        warn!("failed to reap child: {e:?}");
-    } else if let Err(e) = child.wait() {
-        warn!("failed to reap child: {e:?}");
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-async fn reap(mut child: Child) {
-    todo!("help wanted")
-}
 
 /// Spawns the command to run independently of the compositor.
 pub fn spawn(command: Vec<String>, token: Option<XdgActivationToken>) {
@@ -211,7 +182,7 @@ fn do_spawn(command: &OsStr, mut process: Command) -> Option<Child> {
             Ok(())
         });
     }
-    let child = match process.spawn() {
+    let child = match async_process::Command::from(process).spawn() {
         Ok(child) => child,
         Err(err) => {
             warn!("error spawning {command:?}: {err:?}");
@@ -314,7 +285,7 @@ mod systemd {
             });
         }
 
-        let child = match process.spawn() {
+        let child = match async_process::Command::from(process).spawn() {
             Ok(child) => child,
             Err(err) => {
                 warn!("error spawning {command:?}: {err:?}");

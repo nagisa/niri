@@ -2213,6 +2213,7 @@ dependencies = [
  "async-channel",
  "async-executor",
  "async-io",
+ "async-process",
  "atomic",
  "bitflags",
  "bytemuck",
