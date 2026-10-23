@@ -800,7 +800,11 @@ impl State {
         );
         backend.init(&mut niri);
 
-        let mut state = Self { backend, niri, spawner };
+        let mut state = Self {
+            backend,
+            niri,
+            spawner,
+        };
 
         // Load the xkb_file config option if set by the user.
         state.load_xkb_file();

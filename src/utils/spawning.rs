@@ -44,13 +44,13 @@ impl Spawner {
                         let spawnee = spawnee(command, args, token);
                         #[cfg(feature = "systemd")]
                         {
-                            if let Some(server) = spawnserver.take() {
+                            let server = spawnserver.take().or_else(systemd::prepare_spawnserver);
+                            if let Some(server) = server {
                                 ex.spawn(systemd::spawn_in_spawnserver(server, spawnee))
                                     .detach();
                                 spawnserver = systemd::prepare_spawnserver();
                                 continue;
                             }
-                            spawnserver = systemd::prepare_spawnserver();
                         }
                         spawn_cmd(spawnee);
                     }
@@ -122,7 +122,6 @@ pub fn restore_nofile_rlimit() {
     let rlim = rlimit { rlim_cur, rlim_max };
     unsafe { setrlimit(RLIMIT_NOFILE, &rlim) };
 }
-
 
 fn spawn_cmd(mut command: async_process::Command) {
     if let Err(err) = command.spawn() {
@@ -342,10 +341,12 @@ mod systemd {
 
         {
             let Some(mut stdin) = spawnserver.stdin.take() else {
+                // This should be unreachable, but we have a reasonable fallback to try.
                 let _ = spawnserver.kill();
                 return super::spawn_cmd(command);
             };
             let Ok(_) = stdin.write_all(&buf).await else {
+                // Likely reason for a failure here is that spawnserver crashed or got killed.
                 let _ = spawnserver.kill();
                 return super::spawn_cmd(command);
             };
@@ -353,7 +354,7 @@ mod systemd {
         }
 
         if let Some(mut stdout) = spawnserver.stdout.take() {
-            // Wait for exec to happen.
+            // Wait for exec to happen, spawnserver indicates this by closing its stdout.
             let mut buf = [0];
             let result = stdout.read(&mut buf).await;
             debug_assert_eq!(result.map_err(|_| ()), Ok(0));
@@ -402,7 +403,6 @@ mod systemd {
     async fn rescope(conn: zbus::Connection, command: &OsStr, pid: u32) -> anyhow::Result<()> {
         let from = scope_name(OsStr::new("spawnserver"), pid);
         let to = scope_name(command, pid);
-        // Creates `to` with `pid` in it and waits for the job to finish.
         let proxy = zbus::Proxy::new(
             &conn,
             "org.freedesktop.systemd1",
@@ -430,7 +430,7 @@ mod systemd {
             }
             let pids: Vec<u32> = procs.into_iter().map(|(_, pid, _)| pid).collect();
             trace!("moving {pids:?} from {from} to {to}");
-            // Processes may spawn or exit in between; the next GetUnitProcesses reflects that.
+            // Processes may spawn or exit in between iterations.
             if let Err(err) = proxy
                 .call::<_, _, ()>("AttachProcessesToUnit", &(&to, "", &pids))
                 .await

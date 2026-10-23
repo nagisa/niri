@@ -74,7 +74,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if IS_SYSTEMD_SERVICE.load(Ordering::Relaxed) {
         warn!(
             "running as a systemd service, but systemd support is compiled out. \
-            Are you sure you did not forget to set `--features systemd`?"
+             Are you sure you did not forget to set `--features systemd`?"
         );
     }
 
