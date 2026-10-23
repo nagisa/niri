@@ -24,6 +24,64 @@ pub static CHILD_DISPLAY: RwLock<Option<String>> = RwLock::new(None);
 static ORIGINAL_NOFILE_RLIMIT_CUR: Atomic<rlim_t> = Atomic::new(0);
 static ORIGINAL_NOFILE_RLIMIT_MAX: Atomic<rlim_t> = Atomic::new(0);
 
+type Message = (Vec<String>, Option<XdgActivationToken>);
+pub struct Spawner(async_channel::Sender<Message>);
+
+impl Spawner {
+    pub fn new() -> Spawner {
+        let (sender, receiver) = async_channel::unbounded::<Message>();
+        thread::Builder::new()
+            .name("Command Spawner".to_owned())
+            .spawn(move || {
+                let ex = async_executor::LocalExecutor::new();
+                async_io::block_on(ex.run(async {
+                    #[cfg(feature = "systemd")]
+                    let mut spawnserver = systemd::prepare_spawnserver();
+                    while let Ok((command, token)) = receiver.recv().await {
+                        let Some((command, args)) = command.split_first() else {
+                            continue;
+                        };
+                        let spawnee = spawnee(command, args, token);
+                        #[cfg(feature = "systemd")]
+                        {
+                            if let Some(server) = spawnserver.take() {
+                                ex.spawn(systemd::spawn_in_spawnserver(server, spawnee))
+                                    .detach();
+                                spawnserver = systemd::prepare_spawnserver();
+                                continue;
+                            }
+                            spawnserver = systemd::prepare_spawnserver();
+                        }
+                        spawn_cmd(spawnee);
+                    }
+                }));
+            })
+            .unwrap();
+        Self(sender)
+    }
+
+    /// Spawns the command to run independently of the compositor.
+    pub fn spawn(&self, command: Vec<String>, token: Option<XdgActivationToken>) {
+        let _span = tracy_client::span!();
+        if command.is_empty() {
+            return;
+        }
+        if let Err(err) = self.0.send_blocking((command, token)) {
+            warn!("error sending command to the spawning thread: {err:?}");
+        };
+    }
+
+    /// Spawns the command through the shell.
+    ///
+    /// We hardcode `sh -c`, consistent with other compositors:
+    ///
+    /// - https://github.com/swaywm/sway/blob/b3dcde8d69c3f1304b076968a7a64f54d0c958be/sway/commands/exec_always.c#L64
+    /// - https://github.com/hyprwm/Hyprland/blob/1ac1ff457ab8ef1ae6a8f2ab17ee7965adfa729f/src/managers/KeybindManager.cpp#L987
+    pub fn spawn_sh(&self, command: String, token: Option<XdgActivationToken>) {
+        self.spawn(vec![String::from("sh"), String::from("-c"), command], token);
+    }
+}
+
 /// Increases the nofile rlimit to the maximum and stores the original value.
 pub fn store_and_increase_nofile_rlimit() {
     let mut rlim = rlimit {
@@ -65,65 +123,11 @@ pub fn restore_nofile_rlimit() {
     unsafe { setrlimit(RLIMIT_NOFILE, &rlim) };
 }
 
-type Message = (Vec<String>, Option<XdgActivationToken>);
-static SPAWNING_CHANNEL: std::sync::LazyLock<async_channel::Sender<Message>> =
-    std::sync::LazyLock::new(|| {
-        let (sender, receiver) = async_channel::unbounded::<Message>();
-        thread::Builder::new()
-            .name("Command Spawner".to_owned())
-            .spawn(move || {
-                let ex = async_executor::LocalExecutor::new();
-                async_io::block_on(ex.run(async {
-                    #[cfg(feature = "systemd")]
-                    let mut spawnserver = systemd::prepare_spawnserver();
-                    while let Ok((command, token)) = receiver.recv().await {
-                        let Some((command, args)) = command.split_first() else {
-                            continue;
-                        };
-                        let spawnee = spawnee(command, args, token);
-                        #[cfg(feature = "systemd")]
-                        {
-                            if let Some(server) = spawnserver.take() {
-                                ex.spawn(systemd::spawn_in_spawnserver(server, spawnee))
-                                    .detach();
-                                spawnserver = systemd::prepare_spawnserver();
-                                continue;
-                            }
-                            spawnserver = systemd::prepare_spawnserver();
-                        }
-                        spawn_cmd(spawnee);
-                    }
-                }));
-            })
-            .unwrap();
-        sender
-    });
-
-/// Spawns the command to run independently of the compositor.
-pub fn spawn(command: Vec<String>, token: Option<XdgActivationToken>) {
-    let _span = tracy_client::span!();
-    if command.is_empty() {
-        return;
-    }
-    if let Err(err) = SPAWNING_CHANNEL.send_blocking((command, token)) {
-        warn!("error sending command to the spawning thread: {err:?}");
-    };
-}
 
 fn spawn_cmd(mut command: async_process::Command) {
     if let Err(err) = command.spawn() {
         warn!("error spawning {command:?}: {err:?}");
     }
-}
-
-/// Spawns the command through the shell.
-///
-/// We hardcode `sh -c`, consistent with other compositors:
-///
-/// - https://github.com/swaywm/sway/blob/b3dcde8d69c3f1304b076968a7a64f54d0c958be/sway/commands/exec_always.c#L64
-/// - https://github.com/hyprwm/Hyprland/blob/1ac1ff457ab8ef1ae6a8f2ab17ee7965adfa729f/src/managers/KeybindManager.cpp#L987
-pub fn spawn_sh(command: String, token: Option<XdgActivationToken>) {
-    spawn(vec![String::from("sh"), String::from("-c"), command], token);
 }
 
 fn spawnee(
